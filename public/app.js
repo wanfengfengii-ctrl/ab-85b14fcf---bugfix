@@ -29,7 +29,11 @@ const els = {
 };
 
 const STORAGE_KEY = 'algae-lineage-draft-v1';
-const fmt = (v) => (Math.round(v * 100) / 100).toString();
+// number 距离保留两位小数；超大距离以科学计数法文本给出（已是字符串，原样展示），
+// 任何情况下都不把 Infinity/NaN 渲染进表格
+const fmt = (v) => (typeof v === 'number'
+  ? (Math.round(v * 100) / 100).toString()
+  : String(v));
 
 // ---------------- 草稿状态 ----------------
 
@@ -321,18 +325,45 @@ function drawSvg(lineage, frames) {
     return e;
   };
 
-  const allY = frames.flat().map((s) => s.y);
-  const yMin = Math.min(...allY);
-  const yMax = Math.max(...allY);
+  // 坐标范围按十进制文本在 BigInt 域计算：超大坐标基值（如 10^400）经
+  // Math.min(...)/减法会变成 Infinity/NaN，把所有位置折叠到同一点
+  const allBy = frames.flat().map((s) => BigInt(String(s.y).trim()));
+  let yMaxB = allBy[0];
+  for (const v of allBy) { if (v > yMaxB) yMaxB = v; }
+  const spanB = (() => { let lo = allBy[0]; for (const v of allBy) if (v < lo) lo = v; return yMaxB - lo; })();
   const xAt = (f) => padL + (f / (n - 1)) * (VW - padL - padR);
-  const yAt = (y) => (yMin === yMax)
-    ? (top + VH - bottom) / 2
-    : top + ((yMax - y) / (yMax - yMin)) * (VH - top - bottom);
+  // 把 BigInt 纵坐标线性映射到像素；范围落入 double 时用 double 直算（普通坐标
+  // 像素位置与既往完全一致），否则按位数缩放在 BigInt 域做比例，保留相对差异
+  const midYpx = (top + VH - bottom) / 2;
+  const H = VH - top - bottom;
+  let yAt;
+  if (spanB === 0n) {
+    yAt = () => midYpx;
+  } else {
+    const spanN = Number(spanB);
+    if (Number.isFinite(spanN)) {
+      // 相对 yMin 的偏移量必在 span 内（有限），即使坐标基值本身超出 double 也安全：
+      // 共同带超大基值、仅有小相对差异的位置不会被折叠
+      yAt = (y) => top + (Number(yMaxB - y) / spanN) * H;
+    } else {
+      // 比例 = (yMax - y)/span ∈ [0,1]：BigInt 定点数后再缩放，避免 double 溢出
+      const SCALE = 10n ** 20n;
+      yAt = (y) => {
+        const t = ((yMaxB - y) * SCALE) / spanB; // 0..SCALE
+        return top + H - (Number(t) / Number(SCALE)) * H;
+      };
+    }
+  }
+  const yOf = (s) => yAt(BigInt(String(s.y).trim()));
 
   // 每帧内部对 y 坐标相同/过近的斑点做错位排布（仍贴近其真实 y）
+  const xCmp = (sa, sb) => {
+    const d = BigInt(String(sa.x).trim()) - BigInt(String(sb.x).trim());
+    return d < 0n ? -1 : d > 0n ? 1 : 0;
+  };
   const posByFrame = frames.map((spots) => {
-    const sorted = spots.map((s, idx) => ({ s, idx, y: yAt(s.y) }))
-      .sort((a, b) => a.y - b.y || a.s.x - b.s.x || a.idx - b.idx);
+    const sorted = spots.map((s, idx) => ({ s, idx, y: yOf(s) }))
+      .sort((a, b) => a.y - b.y || xCmp(a.s, b.s) || a.idx - b.idx);
     const gap = 17;
     for (let i = 1; i < sorted.length; i++) {
       if (sorted[i].y - sorted[i - 1].y < gap) sorted[i].y = sorted[i - 1].y + gap;
@@ -453,7 +484,7 @@ function drawSegments(lineage, opts) {
         mom,
         `${fr(link.from.frame)} ${pt(seg.from)}`,
         `${fr(link.to.frame)}·${link.to.spot.id} ${pt(seg.to)}`,
-        seg.distance, opts.maxMove,
+        seg.distance, seg.within,
       ));
     } else {
       const [s1, s2] = link.segments;
@@ -462,21 +493,23 @@ function drawSegments(lineage, opts) {
         mom,
         `${fr(link.from.frame)}·${link.from.spot.id} ${pt(s1.from)}`,
         `帧间虚点 (${fmt(s1.to.x)}, ${fmt(s1.to.y)})`,
-        s1.distance, opts.maxMove,
+        s1.distance, s1.within,
       ));
       els.segBody.appendChild(row(
         '<span class="tag tag-skip">漏检段 2/2</span>',
         mom,
         `帧间虚点 (${fmt(s2.from.x)}, ${fmt(s2.from.y)})`,
         `${fr(link.to.frame)}·${link.to.spot.id} ${pt(s2.to)}`,
-        s2.distance, opts.maxMove,
+        s2.distance, s2.within,
       ));
     }
   }
 }
-function row(type, mom, from, to, dist, maxMove) {
+function row(type, mom, from, to, dist, within) {
   const tr = document.createElement('tr');
-  const ok = dist <= maxMove + 1e-9;
+  // 超限与否沿用求解时 BigInt 精确判定（段上 within），不拿展示距离与 double 再比一次：
+  // 超大距离经 Number 比较会得到 Infinity、被误标超限
+  const ok = within;
   tr.innerHTML = `<td>${type}</td><td>${mom}</td><td>${from}</td><td>${to}</td>
     <td class="num">${fmt(dist)}${ok ? ' ✓' : ' ✗'}</td>`;
   return tr;

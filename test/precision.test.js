@@ -203,3 +203,84 @@ test('跨帧漏检的临界边界：总距离超出 2×最大位移即断开', (
   assert.equal(r.ok, false);
   assert.equal(r.brokenGap, 0);
 });
+
+const E199 = (10n ** 199n).toString(); // 10^199：距离平方 10^398 远超 double
+
+test('超大谱系（每帧横移 10^199）：三段位移均有限显示为 10^199 且全部未超限', () => {
+  const frames = [
+    [S('a', '0', '0'), S('q0', '9', '9', 1)],
+    [S('b', E199, '0'), S('q1', '9', '9', 1)],
+    [S('c', (2n * 10n ** 199n).toString(), '0'), S('q2', '9', '9', 1)],
+    [S('d', (3n * 10n ** 199n).toString(), '0'), S('q3', '9', '9', 1)],
+  ];
+  const r = solveLineage(frames, { startId: 'a', maxMove: 1e200, maxSkip: 0, survivors: 1 });
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.lineage.survivors, ['d']);
+  assert.equal(r.lineage.links.length, 3);
+  for (const l of r.lineage.links) {
+    assert.equal(l.kind, 'direct');
+    const seg = l.segments[0];
+    assert.equal(typeof seg.distance, 'number');
+    assert.ok(Number.isFinite(seg.distance), '位移不得为 Infinity');
+    assert.equal(seg.distance, 1e199); // 等价科学计数形式即可
+    assert.equal(seg.within, true);   // 合法连线不得标记超限
+  }
+});
+
+test('超大基值 10^400 上的漏检路径：两段距离均为 1，虚点精确为 10^400+1', () => {
+  const B = (10n ** 400n).toString();
+  const B2 = (10n ** 400n + 2n).toString();
+  const B3 = (10n ** 400n + 3n).toString();
+  const frames = [
+    [S('a', B, '0'), S('q0', '0', '9', 1)],
+    [S('z1', '0', '0', 1), S('z2', '0', '5', 1)], // a 附近无斑点，必须漏检
+    [S('c', B2, '0'), S('q2', '0', '0', 1)],
+    [S('d', B3, '0'), S('q3', '0', '0', 1)],
+  ];
+  const r = solveLineage(frames, { startId: 'a', maxMove: 1, maxSkip: 1, survivors: 1 });
+  assert.equal(r.ok, true);
+  assert.equal(r.lineage.misses, 1);
+  const skip = r.lineage.links.find((l) => l.kind === 'skip');
+  assert.ok(skip);
+  assert.equal(skip.from.spot.id, 'a');
+  assert.equal(skip.to.spot.id, 'c');
+  assert.deepEqual(skip.segments.map((s) => s.distance), [1, 1]);
+  assert.deepEqual(skip.segments.map((s) => s.within), [true, true]);
+  // 帧间虚点必须精确位于 10^400+1，而非 Number 溢出的 Infinity
+  const mid = skip.segments[0].to;
+  assert.equal(mid.frame, 1);
+  assert.equal(mid.x, (10n ** 400n + 1n).toString());
+  assert.equal(mid.y, 0);
+  assert.equal(skip.segments[1].from.x, mid.x);
+  // 直连 c → d 同样距离 1
+  const direct = r.lineage.links.find((l) => l.kind === 'direct');
+  assert.equal(direct.segments[0].distance, 1);
+  assert.equal(direct.segments[0].within, true);
+});
+
+test('超大坐标下超限仍被精确识别：最大位移 1 接不上横移 10^199', () => {
+  const frames = [
+    [S('a', '0', '0'), S('q0', '9', '9', 1)],
+    [S('b', E199, '0'), S('q1', '9', '9', 1)],
+    [S('c', E199, '0'), S('q2', '9', '9', 1)],
+    [S('d', E199, '0'), S('q3', '9', '9', 1)],
+  ];
+  const r = solveLineage(frames, { startId: 'a', maxMove: 1, maxSkip: 0, survivors: 1 });
+  assert.equal(r.ok, false);
+  assert.equal(r.brokenGap, 0);
+});
+
+test('距离大到连 double 都装不下（10^400）时也不产出 Infinity/NaN，给科学计数法文本', () => {
+  const frames = [
+    [S('a', '0', '0'), S('q0', '9', '9', 1)],
+    [S('b', '1', '0', 1), S('q1', '9', '9', 1)],
+    [S('c', '1', '0', 1), S('q2', '9', '9', 1)],
+    [S('d', (10n ** 400n).toString(), '0'), S('q3', '9', '9', 1)],
+  ];
+  const r = solveLineage(frames, { startId: 'a', maxMove: 1e401, maxSkip: 0, survivors: 1 });
+  assert.equal(r.ok, true);
+  const last = r.lineage.links.find((l) => l.to.spot.id === 'd').segments[0];
+  assert.equal(typeof last.distance, 'string');
+  assert.match(last.distance, /^1(\.0+)?e\+400$/);
+  assert.equal(last.within, true);
+});

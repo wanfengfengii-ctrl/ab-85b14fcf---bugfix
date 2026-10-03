@@ -82,6 +82,61 @@ const d2exact = (a, b) => {
 };
 
 /**
+ * 超大平方距离（BigInt）的平方根展示值。Number(d2) 有限时与 Math.sqrt(Number(d2))
+ * 完全一致（普通整数坐标的既有展示不变）；d2 超出 double 范围时，先在 BigInt 域
+ * 除以 10^(2k) 再开方，归一化为 m × 10^e（1 ≤ m < 10），避免 Math.sqrt(Infinity)
+ * 把 10^199 这样的距离显示成 Infinity。
+ * @returns {{num:number, mantissa:null}|{num:null, mantissa:number, exp:number}}
+ */
+function sqrtOfSqDist(d2) {
+  const direct = Number(d2);
+  if (Number.isFinite(direct)) return { num: Math.sqrt(direct), mantissa: null };
+  const digits = d2.toString().length; // d2 ≥ 1 才有位数；d2=0 走上面的有限分支
+  // 在 BigInt 域先除以 10^(2k)，使缩放商至多约 16 位整数（可安全转 double）
+  const k = Math.max(0, Math.ceil((digits - 16) / 2));
+  let m = Math.sqrt(Number(d2 / (10n ** (2n * BigInt(k)))));
+  let e = k;
+  while (m >= 10) { m /= 10; e += 1; } // 归一化到 [1, 10)
+  const num = m * 10 ** e;
+  return Number.isFinite(num) ? { num, mantissa: null } : { num: null, mantissa: m, exp: e };
+}
+
+/** 展示距离取半（跨帧漏检的两段等长，各为总距离的一半），保持同一表示 */
+function halfDistance(info) {
+  if (info.num !== null) return { num: info.num / 2, mantissa: null };
+  let m = info.mantissa / 2;
+  let e = info.exp;
+  if (m < 1) { m *= 10; e -= 1; } // 归一化到 [1, 10)
+  const num = m * 10 ** e;
+  return Number.isFinite(num) ? { num, mantissa: null } : { num: null, mantissa: m, exp: e };
+}
+
+/** 距离信息写入段对象：有限时给 number（既有契约），否则给科学计数法文本 */
+const mantissaText = (m) => parseFloat(m.toPrecision(15)).toString(); // 去掉补位的 0
+const segDistance = (info) => (info.num !== null
+  ? { distance: info.num }
+  : { distance: `${mantissaText(info.mantissa)}e+${info.exp}` });
+
+/**
+ * 整数坐标中点（BigInt 精确）：和为偶数时是整数，奇数时带 .5。
+ * double 可表示时保持 number（普通坐标展示不变），否则给精确十进制文本
+ * （如 (10^400)+(10^400+2) 的中点必须精确显示为 10^400+1，而非 Infinity）。
+ */
+function midpointCoord(p, q) {
+  const sum = p + q;
+  if (sum % 2n === 0n) {
+    const half = sum / 2n;
+    const n = Number(half);
+    return Number.isFinite(n) ? n : half.toString();
+  }
+  // 奇数和：中点为半整数，按绝对值取 floor 后补 .5，保持负号正确
+  const neg = sum < 0n;
+  const whole = ((neg ? -sum : sum) - 1n) / 2n;
+  const n = (neg ? -1 : 1) * (Number(whole) + 0.5);
+  return Number.isFinite(n) ? n : `${neg ? '-' : ''}${whole.toString()}.5`;
+}
+
+/**
  * 把非负有限 double 精确分解为 m × 2^e（double 都是二进有理数），
  * 使 maxMove² 能与 BigInt 平方距离做无精度损失的比较。
  */
@@ -179,27 +234,33 @@ export function validateInput(frames, opts) {
   return errors;
 }
 
-function mkLink(parent, child, kind) {
+function mkLink(parent, child, kind, within) {
   const segments = [];
-  // 距离与中点仅用于展示，由精确 BigInt 坐标换算（是否超限已在求解时精确判定）
+  // 距离与中点仅用于展示，由精确 BigInt 坐标换算（是否超限已在求解时精确判定）。
+  // 超大坐标下 Number(d²) 会溢出成 Infinity，因此平方根与中点都在 BigInt 域先缩放，
+  // 任何合法连线的展示值都不得出现 Infinity/NaN；超限标记沿用求解时的精确判定，
+  // 不依赖展示距离与 double 比较。
   if (kind === 'direct') {
     segments.push({
       from: { frame: parent.f, x: parent.x, y: parent.y },
       to: { frame: child.f, x: child.x, y: child.y },
-      distance: Math.sqrt(Number(d2exact(parent, child))),
+      ...segDistance(sqrtOfSqDist(d2exact(parent, child))),
+      within,
       virtual: false,
     });
   } else {
     // 跨一帧：中间帧按线性插值给出漏检虚点，逐段位移为总距离的一半
-    const half = Math.sqrt(Number(d2exact(parent, child))) / 2;
+    const half = halfDistance(sqrtOfSqDist(d2exact(parent, child)));
     const midFrame = (parent.f + child.f) / 2;
-    const midX = Number(parent.bx + child.bx) / 2;
-    const midY = Number(parent.by + child.by) / 2;
+    const midX = midpointCoord(parent.bx, child.bx);
+    const midY = midpointCoord(parent.by, child.by);
     segments.push(
       { from: { frame: parent.f, x: parent.x, y: parent.y },
-        to: { frame: midFrame, x: midX, y: midY }, distance: half, virtual: true },
+        to: { frame: midFrame, x: midX, y: midY },
+        ...segDistance(half), within, virtual: true },
       { from: { frame: midFrame, x: midX, y: midY },
-        to: { frame: child.f, x: child.x, y: child.y }, distance: half, virtual: true },
+        to: { frame: child.f, x: child.x, y: child.y },
+        ...segDistance(half), within, virtual: true },
     );
   }
   return {
@@ -472,11 +533,19 @@ export function solveLineage(rawFrames, opts) {
       cur.actions.forEach((code, pi) => {
         const parent = parentNode.vis[pi];
         const a = decodeAction(code);
-        if (a.kind === 0) links.push(mkLink(parent, F[pf + 1][a.c], 'direct'));
-        else if (a.kind === 1) {
-          links.push(mkLink(parent, F[pf + 1][a.u], 'direct'));
-          links.push(mkLink(parent, F[pf + 1][a.v], 'direct'));
-        } else links.push(mkLink(parent, F[pf + 2][a.g], 'skip'));
+        if (a.kind === 0) {
+          const child = F[pf + 1][a.c];
+          links.push(mkLink(parent, child, 'direct', withinMove(d2exact(parent, child), 1)));
+        } else if (a.kind === 1) {
+          for (const c of [a.u, a.v]) {
+            const child = F[pf + 1][c];
+            links.push(mkLink(parent, child, 'direct', withinMove(d2exact(parent, child), 1)));
+          }
+        } else {
+          const child = F[pf + 2][a.g];
+          // 求解时按总距离 ≤ 2×最大位移精确判定；虚点为等距中点，两段各为总距离的一半
+          links.push(mkLink(parent, child, 'skip', withinMove(d2exact(parent, child), 4)));
+        }
       });
       gapLinks.push(links);
     }
