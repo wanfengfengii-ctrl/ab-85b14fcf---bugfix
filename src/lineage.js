@@ -82,6 +82,116 @@ const d2exact = (a, b) => {
 };
 
 /**
+ * 非负 BigInt 的整数平方根 ⌊√n⌋（牛顿法，规模上限内迭代次数极少）。
+ * 不经过 Number，任意位数的整数都适用。
+ */
+function isqrtBig(n) {
+  if (n < 2n) return n;
+  let x = 1n << BigInt((n.toString(2).length + 1) >> 1); // 2^⌈bitlen/2⌉ ≥ √n
+  for (;;) {
+    const y = (x + n / x) >> 1n;
+    if (y >= x) return x;
+    x = y;
+  }
+}
+
+/**
+ * 把 √d2 / 2^k 计算为有限 double（k 仅取 0 或 1）：
+ * 在 BigInt 定点数上把平方根按结果所在 double 区间的 ULP 四舍五入，再做
+ * 精确的 2 的幂缩放——全程不经过会溢出的 Number(超大整数)：
+ * 坐标为 10^400 量级时距离仍能有限、精确地显示（10^199 与 JS 字面量 1e199
+ * 完全一致），普通坐标下结果与 Math.sqrt(Number(d2))/2^k 位位相同。
+ */
+function scalePow2(mant, exp) {
+  // 分步施加 2 的幂，避免中间乘积溢出（最终值虽必为有限 double，
+  // 单次乘 2^1300 仍会溢出），同样支持很小的负指数（下溢为 0）。
+  const STEP = 1000;
+  if (exp >= 0) {
+    while (exp > STEP) { mant *= 2 ** STEP; exp -= STEP; }
+    return mant * 2 ** exp;
+  }
+  while (exp < -STEP) { mant /= 2 ** STEP; exp += STEP; }
+  return mant / 2 ** -exp;
+}
+
+/**
+ * 距离超出 double 上限（√d2 > ~1.8e308，仅在最大位移无界时可能出现）时，
+ * 直接由 BigInt 十进制平方根输出科学计数法文本（16 位有效数字，四舍五入），
+ * 保证任何量级下结果都不是 Infinity。k=1 表示再除 2（漏检半段）。
+ */
+function decimalSqrtText(d2, k) {
+  // 在十进制下放大 10^34 后开方：值 ≈ r / 10^17（除 2 等价于先除以 4，整除）
+  const N = k ? d2 * (10n ** 34n) / 4n : d2 * (10n ** 34n);
+  const rstr = isqrtBig(N).toString();
+  const E0 = rstr.length - 18; // r/10^17 的十进制指数
+  // 取 17 位有效数字，按第 18 位四舍五入到 16 位
+  let sig = rstr.slice(0, 17);
+  if (Number(rstr[17] ?? 0) >= 5) sig = (BigInt(sig) + 1n).toString();
+  let mant = sig;
+  let exp = E0;
+  if (mant.length === 18) { mant = mant.slice(0, 17); exp += 1; } // 9.99… 进位为 10.00…
+  const frac = mant.slice(1, 17).replace(/0+$/, '');
+  return `${mant[0]}${frac ? '.' + frac : ''}e${exp >= 0 ? '+' : '-'}${Math.abs(exp)}`;
+}
+
+/**
+ * 把 √d2 / 2^k 计算为最近 double（k=0 直连；k=1 漏检半段）。
+ * 先在 BigInt 上把结果按其自身 binade 的 ULP 四舍五入（ties-to-even），
+ * 再直接拼出 IEEE-754 位模式——全程不经过会溢出的 Number(超大整数)，
+ * 也没有第二次 IEEE 舍入：10^199 与 JS 字面量 1e199 位位相同，
+ * 普通坐标下结果与 Math.sqrt(Number(d2))/2^k 完全一致。
+ */
+function sqrtScaledDouble(d2, k) {
+  if (d2 === 0n) return 0;
+  // √d2 ∈ [2^E,2^(E+1))，E=(bitlen(d2)-1)>>1；结果 z=√d2/2^k 落在
+  // binade p=E−k，其 ULP 为 2^(p−52)。注意网格整数
+  // q = z/ULP = √d2·2^(52−E) 与 k 无关（k 只体现在指数字段 p 上），
+  // 平方放大 A = d2·2^(2(52−E))：BigInt 开方即得 q∈[2^52,2^53)。
+  const b = d2.toString(2).length;
+  const E = (b - 1) >> 1;
+  const p = E - k;
+  const shift = 2 * (52 - E);
+  let q;
+  if (shift >= 0) {
+    const A = d2 << BigInt(shift); // 精确（左移不丢位）
+    q = isqrtBig(A);
+    // A 为整数，√A 不可能恰为半整数（(q+0.5)² 非整数），故无平局
+    if (A - q * q >= (q + 1n) * (q + 1n) - A) q += 1n;
+  } else {
+    // 右移会截掉低位：A=floor(d2/2^h)，用余数 rem 判定四舍五入，
+    // 不能直接对 A 开方，否则 10^199 会显示成 1.0000000000000003e+199。
+    const h = -shift;
+    const D = 1n << BigInt(h);
+    const A = d2 >> BigInt(h);
+    const rem = d2 - A * D;
+    q = isqrtBig(A);
+    // √(A + rem/D) ≥ q + 0.5  ⇔  4·rem ≥ D·(4q + 1 − 4(A−q²))；等号偶值舍入
+    const delta = A - q * q;
+    const cmp = 4n * rem - D * (4n * q + 1n - 4n * delta);
+    if (cmp > 0n || (cmp === 0n && (q & 1n) === 1n)) q += 1n;
+  }
+  // 直接拼 double 位模式：q 即尾数整数（1.xxxxx），指数域 = p+1023
+  const expF = p + 1023;
+  if (expF >= 0x7ff) return decimalSqrtText(d2, k); // 超 double 上限：精确十进制文本
+  if (expF <= 0) return scalePow2(Number(q) / 2 ** 52, p); // 次正规兜底（整数坐标实际不可达）
+  const buf = new DataView(new ArrayBuffer(8));
+  buf.setBigUint64(0, (BigInt(expF) << 52n) | (q - 0x10000000000000n));
+  return buf.getFloat64(0);
+}
+
+/**
+ * 两个 BigInt 坐标之和的一半，输出精确十进制文本：
+ * 和为偶数时是整数，奇数时给出 …… .5（含负数情形）。
+ * 绝不经过 Number——10^400+1 这样的漏检虚点必须逐位精确展示。
+ */
+function halfCoordText(sum) {
+  if (sum % 2n === 0n) return (sum / 2n).toString();
+  const neg = sum < 0n;
+  const a = neg ? -sum : sum; // 正奇数
+  return `${neg ? '-' : ''}${(a / 2n).toString()}.5`;
+}
+
+/**
  * 把非负有限 double 精确分解为 m × 2^e（double 都是二进有理数），
  * 使 maxMove² 能与 BigInt 平方距离做无精度损失的比较。
  */
@@ -179,27 +289,36 @@ export function validateInput(frames, opts) {
   return errors;
 }
 
-function mkLink(parent, child, kind) {
+function mkLink(parent, child, kind, maxMoveSq) {
   const segments = [];
-  // 距离与中点仅用于展示，由精确 BigInt 坐标换算（是否超限已在求解时精确判定）
+  // 距离与中点仅用于展示，由精确 BigInt 坐标换算（是否超限已在求解时精确判定）。
+  // 注意：Number(超大平方距离) 会溢出成 Infinity（如距离 10^199 时平方为 10^398），
+  // 故距离一律走 BigInt 定点平方根后再缩放为有限 double。
+  const d2 = d2exact(parent, child);
   if (kind === 'direct') {
     segments.push({
       from: { frame: parent.f, x: parent.x, y: parent.y },
       to: { frame: child.f, x: child.x, y: child.y },
-      distance: Math.sqrt(Number(d2exact(parent, child))),
+      distance: sqrtScaledDouble(d2, 0),
+      within: maxMoveSq ? maxMoveSq(d2, 1) : true,
       virtual: false,
     });
   } else {
-    // 跨一帧：中间帧按线性插值给出漏检虚点，逐段位移为总距离的一半
-    const half = Math.sqrt(Number(d2exact(parent, child))) / 2;
+    // 跨一帧：中间帧按线性插值给出漏检虚点，逐段位移为总距离的一半。
+    // 虚点坐标直接输出精确十进制文本（和为奇数时带 .5），绝不经过 Number，
+    // 否则 10^400 量级的基值会被压成 Infinity 或把 +1 的相对差抹掉。
+    const half = sqrtScaledDouble(d2, 1);
     const midFrame = (parent.f + child.f) / 2;
-    const midX = Number(parent.bx + child.bx) / 2;
-    const midY = Number(parent.by + child.by) / 2;
+    const midX = halfCoordText(parent.bx + child.bx);
+    const midY = halfCoordText(parent.by + child.by);
+    const withinHalf = maxMoveSq ? maxMoveSq(d2, 4) : true;
     segments.push(
       { from: { frame: parent.f, x: parent.x, y: parent.y },
-        to: { frame: midFrame, x: midX, y: midY }, distance: half, virtual: true },
+        to: { frame: midFrame, x: midX, y: midY }, distance: half,
+        within: withinHalf, virtual: true },
       { from: { frame: midFrame, x: midX, y: midY },
-        to: { frame: child.f, x: child.x, y: child.y }, distance: half, virtual: true },
+        to: { frame: child.f, x: child.x, y: child.y }, distance: half,
+        within: withinHalf, virtual: true },
     );
   }
   return {
@@ -472,11 +591,11 @@ export function solveLineage(rawFrames, opts) {
       cur.actions.forEach((code, pi) => {
         const parent = parentNode.vis[pi];
         const a = decodeAction(code);
-        if (a.kind === 0) links.push(mkLink(parent, F[pf + 1][a.c], 'direct'));
+        if (a.kind === 0) links.push(mkLink(parent, F[pf + 1][a.c], 'direct', withinMove));
         else if (a.kind === 1) {
-          links.push(mkLink(parent, F[pf + 1][a.u], 'direct'));
-          links.push(mkLink(parent, F[pf + 1][a.v], 'direct'));
-        } else links.push(mkLink(parent, F[pf + 2][a.g], 'skip'));
+          links.push(mkLink(parent, F[pf + 1][a.u], 'direct', withinMove));
+          links.push(mkLink(parent, F[pf + 1][a.v], 'direct', withinMove));
+        } else links.push(mkLink(parent, F[pf + 2][a.g], 'skip', withinMove));
       });
       gapLinks.push(links);
     }

@@ -96,6 +96,51 @@ function runLineageScenarios() {
   check('亮杂质不被逐帧贪心接入',
     r3.ok && r3.lineage.survivors.join() === 'd' &&
     !r3.lineage.adopted.some((a) => a.spot.id.startsWith('junk')));
+
+  // 超大整数坐标场景：距离/虚点展示不得出现 Infinity/NaN
+  const allSegs = (lin) => lin.links.flatMap((l) => l.segments);
+  const noBad = (lin) => allSegs(lin).every((g) =>
+    Number.isFinite(g.distance) && g.from.x !== null && g.to.x !== null &&
+    !`${g.from.x},${g.from.y},${g.to.x},${g.to.y}`.includes('Infinity') &&
+    !`${g.from.x},${g.from.y},${g.to.x},${g.to.y}`.includes('NaN'));
+
+  // 场景一：每帧横移 10^199，最大位移 10^200，禁漏检
+  const E199 = '1' + '0'.repeat(199);
+  const big1 = [
+    [S('a', 0, 0), S('z', 9, 9, 1)],
+    [S('b', E199, 0), S('z', 9, 9, 1)],
+    [S('c', '2' + '0'.repeat(199), 0), S('z', 9, 9, 1)],
+    [S('d', '3' + '0'.repeat(199), 0), S('z', 9, 9, 1)],
+  ];
+  const r4 = solveLineage(big1, { startId: 'a', maxMove: 1e200, maxSkip: 0, survivors: 1 });
+  check('超大坐标场景一：三段直连均求解成功', r4.ok && r4.lineage.links.length === 3,
+    JSON.stringify(r4).slice(0, 200));
+  check('超大坐标场景一：距离有限为 10^199 且均未超限',
+    r4.ok && r4.lineage.links.every((l) => {
+      const g = l.segments[0];
+      return Number.isFinite(g.distance) && g.distance === 1e199 && g.within === true;
+    }));
+  check('超大坐标场景一：展示数据无 Infinity/NaN', r4.ok && noBad(r4.lineage));
+
+  // 场景二：10^400 基值上跨一帧漏检，虚点须精确为 (10^400+1, 0)
+  const B = 10n ** 400n;
+  const bx = (d) => (B + BigInt(d)).toString();
+  const big2 = [
+    [S('a', bx(0), 0), S('z', 9, 9, 1)],
+    [S('m1', 0, 0, 1), S('m2', 0, 5, 1)],
+    [S('c', bx(2), 0), S('z', 9, 9, 1)],
+    [S('d', bx(3), 0), S('z', 9, 9, 1)],
+  ];
+  const r5 = solveLineage(big2, { startId: 'a', maxMove: 1, maxSkip: 1, survivors: 1 });
+  const skip5 = r5.ok && r5.lineage.links.find((l) => l.kind === 'skip');
+  check('超大坐标场景二：采用跨帧漏检路径',
+    r5.ok && r5.lineage.misses === 1 && skip5 &&
+    skip5.from.spot.id === 'a' && skip5.to.spot.id === 'c');
+  check('超大坐标场景二：虚点精确为 (10^400+1, 0)，两段距离各为 1',
+    !!skip5 && skip5.segments[0].to.x === bx(1) && skip5.segments[0].to.y === '0' &&
+    skip5.segments[0].distance === 1 && skip5.segments[1].distance === 1 &&
+    skip5.segments[0].within === true);
+  check('超大坐标场景二：展示数据无 Infinity/NaN', r5.ok && noBad(r5.lineage));
 }
 
 // ---------- HTTP 层：健康检查与静态资源 ----------

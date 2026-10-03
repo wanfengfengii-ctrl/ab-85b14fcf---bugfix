@@ -29,7 +29,21 @@ const els = {
 };
 
 const STORAGE_KEY = 'algae-lineage-draft-v1';
-const fmt = (v) => (Math.round(v * 100) / 100).toString();
+// 普通数值保留两位小数；超出 double 十进制精度或过小则用科学计数法
+// （距离 10^199 显示为 1e+199 这样的等价形式，绝不能出现 Infinity）。
+const fmt = (v) => {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return String(v);
+  const abs = Math.abs(n);
+  if (abs !== 0 && (abs >= 1e21 || abs < 1e-6)) {
+    return n.toExponential(6).replace(/\.?0+e/, 'e');
+  }
+  return (Math.round(n * 100) / 100).toString();
+};
+// 坐标文本原样展示（超大整数的逐位精度由算法以字符串给出，不经 Number）
+const coordText = (v) => String(v);
+// 已校验的整数坐标（number / 十进制文本 / bigint）统一转 BigInt 供绘图比例计算
+const toBI = (v) => BigInt(typeof v === 'number' ? v : String(v).trim());
 
 // ---------------- 草稿状态 ----------------
 
@@ -321,18 +335,30 @@ function drawSvg(lineage, frames) {
     return e;
   };
 
-  const allY = frames.flat().map((s) => s.y);
-  const yMin = Math.min(...allY);
-  const yMax = Math.max(...allY);
-  const xAt = (f) => padL + (f / (n - 1)) * (VW - padL - padR);
-  const yAt = (y) => (yMin === yMax)
-    ? (top + VH - bottom) / 2
-    : top + ((yMax - y) / (yMax - yMin)) * (VH - top - bottom);
+  // 坐标比例必须在 BigInt 上计算：全部斑点共享 10^400 量级基值时，
+  // Math.min/减法会产生 NaN/Infinity 并把相对差折叠。做法：减去最小基值后，
+  // 在 BigInt 定点数上求相对比例（比例恒在 [0,1]，永远可表示为有限 double），
+  // 绝不把超大跨度本身换算成 Number（10^400 > Number.MAX_VALUE）。
+  const bys = frames.flat().map((s) => toBI(s.y));
+  const minOf = (arr) => arr.reduce((m, v) => (v < m ? v : m));
+  const maxOf = (arr) => arr.reduce((m, v) => (v > m ? v : m));
+  const yBase = minOf(bys);
+  const ySpan = maxOf(bys) - yBase;
+  // (v - yBase) / ySpan → [0,1] 的 double：BigInt 定点除法，任意跨度都不溢出
+  const ratioToBase = (v) => {
+    if (ySpan === 0n) return 0.5;
+    const off = v - yBase;
+    return Number((off << 53n) / ySpan) / 2 ** 53;
+  };
 
-  // 每帧内部对 y 坐标相同/过近的斑点做错位排布（仍贴近其真实 y）
+  const xAt = (f) => padL + (f / (n - 1)) * (VW - padL - padR);
+  const yAt = (by) => top + (1 - ratioToBase(by)) * (VH - top - bottom);
+
+  // 每帧内部对 y 坐标相同/过近的斑点做错位排布（仍贴近其真实 y）。
+  // 排序键一律使用 BigInt 精确比较，超大坐标下也不会出现 NaN。
   const posByFrame = frames.map((spots) => {
-    const sorted = spots.map((s, idx) => ({ s, idx, y: yAt(s.y) }))
-      .sort((a, b) => a.y - b.y || a.s.x - b.s.x || a.idx - b.idx);
+    const sorted = spots.map((s, idx) => ({ s, idx, bx: toBI(s.x), by: toBI(s.y), y: yAt(toBI(s.y)) }))
+      .sort((a, b) => a.y - b.y || (a.bx < b.bx ? -1 : a.bx > b.bx ? 1 : 0) || a.idx - b.idx);
     const gap = 17;
     for (let i = 1; i < sorted.length; i++) {
       if (sorted[i].y - sorted[i - 1].y < gap) sorted[i].y = sorted[i - 1].y + gap;
@@ -443,7 +469,7 @@ function drawAdopted(lineage) {
 function drawSegments(lineage, opts) {
   els.segBody.innerHTML = '';
   const fr = (f) => `帧 ${f + 1}`;
-  const pt = (p) => `(${p.x}, ${p.y})`;
+  const pt = (p) => `(${coordText(p.x)}, ${coordText(p.y)})`;
   for (const link of lineage.links) {
     const mom = `${fr(link.from.frame)}·${link.from.spot.id}`;
     if (link.kind === 'direct') {
@@ -453,7 +479,7 @@ function drawSegments(lineage, opts) {
         mom,
         `${fr(link.from.frame)} ${pt(seg.from)}`,
         `${fr(link.to.frame)}·${link.to.spot.id} ${pt(seg.to)}`,
-        seg.distance, opts.maxMove,
+        seg.distance, seg.within,
       ));
     } else {
       const [s1, s2] = link.segments;
@@ -461,22 +487,23 @@ function drawSegments(lineage, opts) {
         '<span class="tag tag-skip">漏检段 1/2</span>',
         mom,
         `${fr(link.from.frame)}·${link.from.spot.id} ${pt(s1.from)}`,
-        `帧间虚点 (${fmt(s1.to.x)}, ${fmt(s1.to.y)})`,
-        s1.distance, opts.maxMove,
+        `帧间虚点 (${coordText(s1.to.x)}, ${coordText(s1.to.y)})`,
+        s1.distance, s1.within,
       ));
       els.segBody.appendChild(row(
         '<span class="tag tag-skip">漏检段 2/2</span>',
         mom,
-        `帧间虚点 (${fmt(s2.from.x)}, ${fmt(s2.from.y)})`,
+        `帧间虚点 (${coordText(s2.from.x)}, ${coordText(s2.from.y)})`,
         `${fr(link.to.frame)}·${link.to.spot.id} ${pt(s2.to)}`,
-        s2.distance, opts.maxMove,
+        s2.distance, s2.within,
       ));
     }
   }
 }
-function row(type, mom, from, to, dist, maxMove) {
+function row(type, mom, from, to, dist, within) {
   const tr = document.createElement('tr');
-  const ok = dist <= maxMove + 1e-9;
+  // 超限判定直接采用求解时 BigInt 精确比较的结论，不用 double 近似
+  const ok = within === undefined ? dist <= Number(draft.params.maxMove) + 1e-9 : within;
   tr.innerHTML = `<td>${type}</td><td>${mom}</td><td>${from}</td><td>${to}</td>
     <td class="num">${fmt(dist)}${ok ? ' ✓' : ' ✗'}</td>`;
   return tr;
